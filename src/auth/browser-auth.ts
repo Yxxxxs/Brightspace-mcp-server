@@ -1,0 +1,741 @@
+/**
+ * Brightspace MCP Server
+ * Original work Copyright (c) 2025 Rohan Muppa. Licensed under AGPL-3.0.
+ * Licensed under AGPL-3.0 — see LICENSE file for details.
+ */
+
+import { chromium } from "playwright";
+import type { BrowserContext, Page } from "playwright";
+import * as path from "node:path";
+import * as fs from "node:fs/promises";
+import type { AppConfig, TokenData } from "../types/index.js";
+import { BrowserAuthError } from "../utils/errors.js";
+import { log } from "../utils/logger.js";
+import { GenericSSOFlow } from "./generic-sso.js";
+
+export class BrowserAuth {
+  private config: AppConfig;
+  private ssoFlow: GenericSSOFlow;
+
+  constructor(config: AppConfig) {
+    this.config = config;
+    this.ssoFlow = new GenericSSOFlow();
+  }
+
+  /**
+   * Detect if running inside WSL (Windows Subsystem for Linux) or Docker.
+   * These environments require --no-sandbox for Chromium to launch.
+   */
+  private static isWSLOrDocker(): boolean {
+    try {
+      // WSL: /proc/version contains "microsoft" or "WSL"
+      const procVersion = require("node:fs").readFileSync("/proc/version", "utf-8");
+      if (/microsoft|wsl/i.test(procVersion)) return true;
+    } catch {
+      // Not Linux or /proc not available
+    }
+    try {
+      // Docker: /.dockerenv exists or /proc/1/cgroup contains "docker"
+      require("node:fs").accessSync("/.dockerenv");
+      return true;
+    } catch {
+      // Not Docker
+    }
+    try {
+      const cgroup = require("node:fs").readFileSync("/proc/1/cgroup", "utf-8");
+      if (cgroup.includes("docker") || cgroup.includes("containerd")) return true;
+    } catch {
+      // Not in a container
+    }
+    return false;
+  }
+
+  /**
+   * Build Chromium launch args based on the current platform and environment.
+   */
+  private static buildChromiumArgs(): string[] {
+    const args = ["--disable-blink-features=AutomationControlled"];
+
+    if (process.platform === "win32") {
+      // Reduce GPU issues on Windows (common cause of rendering failures)
+      args.push("--disable-gpu");
+    }
+
+    if (BrowserAuth.isWSLOrDocker()) {
+      // WSL and Docker lack a proper sandboxing namespace — Chromium won't launch without this
+      args.push("--no-sandbox", "--disable-setuid-sandbox");
+      log("INFO", "Detected WSL/Docker environment — launching Chromium with --no-sandbox");
+    }
+
+    return args;
+  }
+
+  async authenticate(): Promise<TokenData> {
+    let context: BrowserContext | null = null;
+
+    try {
+      log("INFO", "Starting browser authentication");
+
+      const mkdirOpts: { recursive: true; mode?: number } = { recursive: true };
+      if (process.platform !== "win32") {
+        mkdirOpts.mode = 0o700;
+      }
+      await fs.mkdir(this.config.sessionDir, mkdirOpts);
+
+      const browserDataDir = path.join(this.config.sessionDir, "browser-data");
+
+      // Remove stale Chromium lock files that can block persistent context launch.
+      // On Windows, if the browser is killed by antivirus or force-closed, these
+      // lock files persist and prevent all future auth attempts.
+      await this.clearStaleLockFiles(browserDataDir);
+
+      // Force headed mode when no credentials — user must interact with the browser
+      const headless = this.ssoFlow.hasCredentials() ? this.config.headless : false;
+      if (!this.ssoFlow.hasCredentials() && this.config.headless) {
+        log("INFO", "Overriding headless mode — browser must be visible for manual login");
+      }
+
+      const launchOptions = {
+        headless,
+        viewport: { width: 1280, height: 720 } as const,
+        args: BrowserAuth.buildChromiumArgs(),
+        timeout: 60000,
+      };
+
+      context = await this.launchBrowserWithRetry(browserDataDir, launchOptions);
+
+      log("INFO", "Browser context launched");
+
+      // Load saved storage state if it exists (cookies + localStorage)
+      // This works around Playwright bug #36139 where session cookies don't persist
+      await this.loadStorageState(context);
+
+      const page = context.pages()[0] || (await context.newPage());
+
+      // CRITICAL: Set up token interception BEFORE navigation
+      // Use longer timeout for manual login (5 min) vs automated SSO (2 min)
+      const interceptTimeout = this.ssoFlow.hasCredentials() ? 120000 : 300000;
+      const tokenPromise = this.setupTokenInterception(page, interceptTimeout);
+
+      // Navigate and login if needed
+      const alreadyAuthenticated = await this.navigateAndLogin(page);
+
+      // If already authenticated via cookies, Bearer tokens won't appear in
+      // normal page requests. Try strategies to extract a usable token.
+      // Each strategy validates the token against /users/whoami before accepting.
+      if (alreadyAuthenticated) {
+        log("INFO", "Session cookies active — trying to extract API token");
+
+        // Strategy 0: Try extracting Bearer token from localStorage (fastest)
+        const localStorageToken = await this.extractLocalStorageToken(page);
+        if (localStorageToken) {
+          const valid = await this.validateToken(localStorageToken);
+          if (valid) {
+            log("INFO", "Extracted valid Bearer token from localStorage");
+            const now = Date.now();
+            const tokenData: TokenData = {
+              accessToken: localStorageToken,
+              capturedAt: now,
+              expiresAt: now + this.config.tokenTtl * 1000,
+              source: "browser",
+            };
+            await this.saveStorageState(context);
+            return tokenData;
+          }
+          log("WARN", "localStorage Bearer token failed validation, trying next strategy");
+        }
+
+        // Strategy 1: Navigate to API endpoint to trigger Bearer-bearing requests
+        try {
+          log("DEBUG", "Navigating to API endpoint to trigger token capture");
+          await page.goto(
+            `${this.config.baseUrl}/d2l/api/lp/1.57/users/whoami`,
+            { waitUntil: "load", timeout: 15000 }
+          );
+        } catch {
+          log("DEBUG", "Direct API navigation did not produce Bearer token");
+        }
+
+        // Strategy 2: Try extracting XSRF token from D2L's JavaScript context
+        const xsrfToken = await this.extractXsrfToken(page);
+        if (xsrfToken) {
+          const valid = await this.validateToken(xsrfToken);
+          if (valid) {
+            log("INFO", "Extracted valid XSRF token from page context");
+            const now = Date.now();
+            const tokenData: TokenData = {
+              accessToken: xsrfToken,
+              capturedAt: now,
+              expiresAt: now + this.config.tokenTtl * 1000,
+              source: "browser",
+            };
+            await this.saveStorageState(context);
+            return tokenData;
+          }
+          log("WARN", "XSRF token failed validation, trying next strategy");
+        }
+
+        // Strategy 3: Extract session cookies for cookie-based API auth
+        const cookieToken = await this.extractCookieToken(context);
+        if (cookieToken) {
+          const valid = await this.validateToken(cookieToken);
+          if (valid) {
+            log("INFO", "Extracted valid session cookie for API auth");
+            const now = Date.now();
+            const tokenData: TokenData = {
+              accessToken: cookieToken,
+              capturedAt: now,
+              expiresAt: now + this.config.tokenTtl * 1000,
+              source: "browser",
+            };
+            await this.saveStorageState(context);
+            return tokenData;
+          }
+          log("WARN", "Cookie token failed validation, trying next strategy");
+        }
+
+        // Strategy 4: Clear cookies and force full re-login through SSO
+        log("WARN", "Could not extract valid token from existing session, forcing re-login");
+        await context.clearCookies();
+        // Close the old page and open a fresh one to kill any in-flight
+        // Brightspace redirects that would interrupt our next navigation
+        await page.close();
+        const freshPage = await context.newPage();
+        const freshTokenPromise = this.setupTokenInterception(freshPage);
+        await this.navigateAndLogin(freshPage);
+        const accessToken = await freshTokenPromise;
+        log("INFO", "Bearer token captured after forced re-login");
+        const now = Date.now();
+        const tokenData: TokenData = {
+          accessToken,
+          capturedAt: now,
+          expiresAt: now + this.config.tokenTtl * 1000,
+          source: "browser",
+        };
+        await this.saveStorageState(context);
+        return tokenData;
+      }
+
+      // Try direct token extraction strategies first
+      log("INFO", "Trying direct token extraction strategies");
+
+      // Give the page a moment to settle after login
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Navigate to Brightspace home to ensure D2L cookies are set
+      try {
+        await page.goto(`${this.config.baseUrl}/d2l/home`, {
+          waitUntil: "networkidle",
+          timeout: 15000,
+        });
+      } catch {
+        log("DEBUG", "Navigation to /d2l/home after login timed out, continuing anyway");
+      }
+
+      // Strategy 1: Try localStorage Bearer token (best if available)
+      const lsToken = await this.extractLocalStorageToken(page);
+      if (lsToken) {
+        const valid = await this.validateToken(lsToken);
+        if (valid) {
+          log("INFO", "Extracted valid Bearer token from localStorage");
+          const now = Date.now();
+          await this.saveStorageState(context);
+          return { accessToken: lsToken, capturedAt: now, expiresAt: now + this.config.tokenTtl * 1000, source: "browser" };
+        }
+      }
+
+      // Strategy 2: Try XSRF token
+      const xsrfToken = await this.extractXsrfToken(page);
+      if (xsrfToken) {
+        const valid = await this.validateToken(xsrfToken);
+        if (valid) {
+          log("INFO", "Extracted valid XSRF token");
+          const now = Date.now();
+          await this.saveStorageState(context);
+          return { accessToken: xsrfToken, capturedAt: now, expiresAt: now + this.config.tokenTtl * 1000, source: "browser" };
+        }
+      }
+
+      // Strategy 3: Extract cookies and accept without server-side validation
+      // Server-side fetch with cookies often fails because D2L requires additional
+      // headers that the browser sends automatically but Node fetch doesn't.
+      // Since the user just completed login, we trust the cookies are valid.
+      const cookieToken = await this.extractCookieToken(context);
+      if (cookieToken) {
+        log("INFO", "Extracted D2L session cookies — accepting without server-side validation");
+        const now = Date.now();
+        await this.saveStorageState(context);
+        return { accessToken: cookieToken, capturedAt: now, expiresAt: now + this.config.tokenTtl * 1000, source: "browser" };
+      }
+
+      // If no cookies found at all, something is wrong
+      throw new BrowserAuthError(
+        "Login appeared successful but no D2L session cookies were found.",
+        "token_extraction"
+      );
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      log("ERROR", "Browser authentication failed", error);
+
+      // Provide platform-specific troubleshooting hints
+      let hint = "";
+      if (process.platform === "win32") {
+        if (errMsg.includes("Target page, context or browser has been closed")) {
+          hint = " (Windows hint: antivirus or firewall may be closing the browser. Try adding Chromium to your exclusion list.)";
+        } else if (errMsg.includes("EPERM") || errMsg.includes("EACCES")) {
+          hint = " (Windows hint: try running as Administrator, or check that no other process has locked the session directory.)";
+        } else if (errMsg.includes("Timeout") || errMsg.includes("timeout")) {
+          hint = " (Windows hint: browser launch timed out. Close all Chromium/Chrome instances in Task Manager and try again. Antivirus may also be blocking the launch.)";
+        }
+      }
+      if (BrowserAuth.isWSLOrDocker() && (errMsg.includes("spawn") || errMsg.includes("ENOENT") || errMsg.includes("sandbox"))) {
+        hint = " (WSL/Docker hint: ensure Chromium dependencies are installed. Run: npx playwright install-deps chromium)";
+      }
+
+      throw new BrowserAuthError(
+        `Authentication failed${hint}`,
+        "authenticate",
+        error as Error
+      );
+    } finally {
+      if (context) {
+        log("DEBUG", "Closing browser context");
+        try {
+          await context.close();
+        } catch (closeError) {
+          // Context may already be closed (e.g. browser crashed or was closed externally).
+          // This is common on Windows where the browser process can terminate unexpectedly.
+          log("DEBUG", "Browser context already closed or failed to close", closeError);
+        }
+      }
+    }
+  }
+
+  /**
+   * Validate a token by making a test API call to /users/whoami.
+   * Returns true if the token is accepted by D2L, false otherwise.
+   */
+  private async validateToken(token: string): Promise<boolean> {
+    try {
+      const headers: Record<string, string> = {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      };
+
+      if (token.startsWith("cookie:")) {
+        headers["Cookie"] = token.substring(7);
+      } else {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
+      const response = await fetch(
+        `${this.config.baseUrl}/d2l/api/lp/1.45/users/whoami`,
+        {
+          method: "GET",
+          headers,
+          signal: AbortSignal.timeout(10000),
+        }
+      );
+
+      if (response.ok) {
+        log("DEBUG", "Token validation succeeded (whoami returned 200)");
+        return true;
+      }
+
+      log("DEBUG", `Token validation failed: HTTP ${response.status}`);
+      return false;
+    } catch (error) {
+      log("DEBUG", "Token validation error", error);
+      return false;
+    }
+  }
+
+  /**
+   * Set up passive network request listener to capture Bearer token.
+   * MUST be called BEFORE page.goto() to avoid race condition.
+   */
+  private setupTokenInterception(page: Page, timeoutMs = 120000): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(
+          new BrowserAuthError(
+            `Token interception timed out after ${timeoutMs / 1000} seconds`,
+            "token_interception"
+          )
+        );
+      }, timeoutMs);
+
+      page.on("request", (request) => {
+        const url = request.url();
+
+        // Look for any request with a Bearer token
+        if (url.includes("/d2l/")) {
+          const authHeader = request.headers()["authorization"];
+
+          if (authHeader && authHeader.startsWith("Bearer ")) {
+            const token = authHeader.substring("Bearer ".length);
+            log("DEBUG", `Token captured from request to ${url}`);
+            clearTimeout(timeout);
+            resolve(token);
+          }
+        }
+      });
+
+      log("DEBUG", "Token interception listener registered");
+    });
+  }
+
+  /**
+   * Navigate to Brightspace and login if needed.
+   * Returns true if already authenticated (cookies valid), false if SSO login was performed.
+   */
+  private async navigateAndLogin(page: Page): Promise<boolean> {
+    try {
+      log("INFO", `Navigating to ${this.config.baseUrl}/d2l/home`);
+      await page.goto(`${this.config.baseUrl}/d2l/home`, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+
+      const currentUrl = page.url();
+      log("DEBUG", `Current URL after navigation: ${currentUrl}`);
+
+      // If we were redirected away from /d2l/home, login is required
+      const needsLogin = !currentUrl.includes("/d2l/home");
+
+      if (needsLogin) {
+        let loginSuccess: boolean;
+
+        if (this.ssoFlow.hasCredentials()) {
+          log("INFO", `Login required (redirected to ${currentUrl}) - starting SSO flow`);
+          loginSuccess = await this.ssoFlow.login(page);
+        } else {
+          log("INFO", `Login required (redirected to ${currentUrl}) - opening browser for manual login`);
+          loginSuccess = await this.ssoFlow.manualLogin(page);
+        }
+
+        if (!loginSuccess) {
+          throw new BrowserAuthError("SSO login flow failed", "sso_login");
+        }
+
+        await page.waitForLoadState("networkidle", { timeout: 30000 });
+        return false;
+      }
+
+      log("INFO", "Already authenticated - skipping SSO login");
+      await page.waitForLoadState("networkidle", { timeout: 30000 });
+      return true;
+    } catch (error) {
+      if (error instanceof BrowserAuthError) throw error;
+      throw new BrowserAuthError(
+        "Failed to navigate and login",
+        "navigate_login",
+        error as Error
+      );
+    }
+  }
+
+  /**
+   * Try to extract Bearer token from D2L's localStorage.
+   * D2L stores API tokens in localStorage under "D2L.Fetch.Tokens".
+   */
+  private async extractLocalStorageToken(page: Page): Promise<string | null> {
+    try {
+      // Navigate to Brightspace home if not already there
+      const currentUrl = page.url();
+      if (!currentUrl.includes("/d2l/home")) {
+        await page.goto(`${this.config.baseUrl}/d2l/home`, {
+          waitUntil: "networkidle",
+          timeout: 15000,
+        });
+      }
+
+      const token = await page.evaluate(() => {
+        try {
+          const tokensJson = localStorage.getItem("D2L.Fetch.Tokens");
+          if (!tokensJson) return null;
+
+          const tokens = JSON.parse(tokensJson);
+          // Tokens are stored as { "*:*:*": { access_token: "...", expires_at: ... } }
+          const wildcardToken = tokens["*:*:*"];
+          if (wildcardToken && wildcardToken.access_token) {
+            return wildcardToken.access_token;
+          }
+
+          return null;
+        } catch {
+          return null;
+        }
+      });
+
+      if (token) {
+        log("DEBUG", "Found Bearer token in localStorage (D2L.Fetch.Tokens)");
+        return token;
+      }
+
+      return null;
+    } catch (error) {
+      log("DEBUG", "localStorage token extraction failed", error);
+      return null;
+    }
+  }
+
+  /**
+   * Try to extract XSRF/API token from D2L's JavaScript context.
+   * Brightspace stores auth tokens in the page's JS globals.
+   */
+  private async extractXsrfToken(page: Page): Promise<string | null> {
+    try {
+      // Navigate back to homepage where D2L JS context is available
+      const currentUrl = page.url();
+      if (!currentUrl.includes("/d2l/home")) {
+        await page.goto(`${this.config.baseUrl}/d2l/home`, {
+          waitUntil: "networkidle",
+          timeout: 15000,
+        });
+      }
+
+      const token = await page.evaluate(() => {
+        // D2L stores XSRF token in various places
+        // Try common D2L token locations
+        const d2l = (window as unknown as Record<string, unknown>).D2L as
+          | Record<string, unknown>
+          | undefined;
+
+        if (d2l) {
+          // Try D2L.LP.Web.Authentication.Xsrf.GetXsrfToken()
+          try {
+            const lp = d2l.LP as Record<string, unknown> | undefined;
+            const web = lp?.Web as Record<string, unknown> | undefined;
+            const auth = web?.Authentication as
+              | Record<string, unknown>
+              | undefined;
+            const xsrf = auth?.Xsrf as Record<string, unknown> | undefined;
+            const getToken = xsrf?.GetXsrfToken as (() => string) | undefined;
+            if (getToken) return getToken();
+          } catch {
+            // Not available
+          }
+        }
+
+        // Try extracting from meta tags or script data
+        const metaToken = document.querySelector(
+          'meta[name="d2l-xsrf-token"]'
+        );
+        if (metaToken) return metaToken.getAttribute("content");
+
+        // Try extracting from local storage
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && (key.includes("token") || key.includes("Token"))) {
+            const val = localStorage.getItem(key);
+            if (val && val.length > 20) return val;
+          }
+        }
+
+        return null;
+      });
+
+      if (token) {
+        log("DEBUG", "Found token via page JavaScript context");
+        return token;
+      }
+
+      return null;
+    } catch (error) {
+      log("DEBUG", "XSRF token extraction failed", error);
+      return null;
+    }
+  }
+
+  /**
+   * Extract D2L session cookies that can be used for cookie-based API auth.
+   * Constructs a cookie header string from d2lSessionVal and d2lSecureSessionVal.
+   */
+  private async extractCookieToken(
+    context: BrowserContext
+  ): Promise<string | null> {
+    try {
+      const cookies = await context.cookies(this.config.baseUrl);
+      const relevantCookies = cookies.filter(
+        (c) =>
+          c.name === "d2lSessionVal" ||
+          c.name === "d2lSecureSessionVal" ||
+          c.name.startsWith("d2l")
+      );
+
+      if (relevantCookies.length === 0) {
+        log("DEBUG", "No D2L session cookies found");
+        return null;
+      }
+
+      // Build a cookie string for API requests
+      const cookieStr = relevantCookies
+        .map((c) => `${c.name}=${c.value}`)
+        .join("; ");
+
+      log(
+        "DEBUG",
+        `Found ${relevantCookies.length} D2L cookies: ${relevantCookies.map((c) => c.name).join(", ")}`
+      );
+      return `cookie:${cookieStr}`;
+    } catch (error) {
+      log("DEBUG", "Cookie extraction failed", error);
+      return null;
+    }
+  }
+
+  /**
+   * Load previously saved storage state (cookies + localStorage).
+   * Workaround for Playwright bug #36139: session cookies don't persist in persistent context.
+   */
+  private async loadStorageState(context: BrowserContext): Promise<void> {
+    try {
+      const storageStatePath = path.join(
+        this.config.sessionDir,
+        "storage-state.json"
+      );
+
+      // Check if storage state file exists
+      try {
+        await fs.access(storageStatePath);
+      } catch {
+        log("DEBUG", "No existing storage state to load");
+        return;
+      }
+
+      // Read storage state
+      const stateJson = await fs.readFile(storageStatePath, "utf-8");
+      const state = JSON.parse(stateJson) as {
+        cookies: Array<{
+          name: string;
+          value: string;
+          domain: string;
+          path: string;
+          expires: number;
+          httpOnly: boolean;
+          secure: boolean;
+          sameSite: "Strict" | "Lax" | "None";
+        }>;
+        origins: Array<{
+          origin: string;
+          localStorage: Array<{ name: string; value: string }>;
+        }>;
+      };
+
+      // Restore cookies
+      if (state.cookies && state.cookies.length > 0) {
+        await context.addCookies(state.cookies);
+        log(
+          "INFO",
+          `Restored ${state.cookies.length} cookies from storage state`
+        );
+      }
+
+      // Restore localStorage for each origin
+      if (state.origins && state.origins.length > 0) {
+        for (const origin of state.origins) {
+          if (origin.localStorage && origin.localStorage.length > 0) {
+            let tempPage: Page | null = null;
+            try {
+              // Create a temporary page to set localStorage
+              tempPage = await context.newPage();
+              await tempPage.goto(origin.origin, { timeout: 10000 });
+
+              // Set each localStorage item
+              await tempPage.evaluate((items) => {
+                for (const item of items) {
+                  localStorage.setItem(item.name, item.value);
+                }
+              }, origin.localStorage);
+
+              log(
+                "INFO",
+                `Restored ${origin.localStorage.length} localStorage items for ${origin.origin}`
+              );
+            } catch (originError) {
+              log("WARN", `Failed to restore localStorage for ${origin.origin}`, originError);
+            } finally {
+              if (tempPage) {
+                try {
+                  await tempPage.close();
+                } catch {
+                  // Page may already be closed
+                }
+              }
+            }
+          }
+        }
+      }
+
+      log("INFO", "Storage state restored successfully");
+    } catch (error) {
+      log("WARN", "Failed to load storage state", error);
+    }
+  }
+
+  private async saveStorageState(context: BrowserContext): Promise<void> {
+    try {
+      const storageStatePath = path.join(
+        this.config.sessionDir,
+        "storage-state.json"
+      );
+      await context.storageState({ path: storageStatePath });
+      log("DEBUG", `Storage state saved to ${storageStatePath}`);
+    } catch (error) {
+      log("WARN", "Failed to save storage state", error);
+    }
+  }
+
+  /**
+   * Launch browser with retry logic.
+   * Windows is prone to 180s launch timeouts (Playwright issue #22117) caused by
+   * lingering Chromium processes, antivirus interference, or resource contention.
+   * On timeout, we clear lock files and retry once.
+   */
+  private async launchBrowserWithRetry(
+    browserDataDir: string,
+    options: {
+      headless: boolean;
+      viewport: { readonly width: number; readonly height: number };
+      args: string[];
+      timeout: number;
+    }
+  ): Promise<BrowserContext> {
+    try {
+      return await chromium.launchPersistentContext(browserDataDir, options);
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      const isTimeout = errMsg.includes("Timeout") || errMsg.includes("timeout");
+
+      if (isTimeout) {
+        log("WARN", "Browser launch timed out — clearing lock files and retrying");
+        await this.clearStaleLockFiles(browserDataDir);
+        return await chromium.launchPersistentContext(browserDataDir, {
+          ...options,
+          timeout: 90000, // More generous timeout on retry
+        });
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Remove stale Chromium lock files from the browser data directory.
+   * Playwright's persistent context uses Chromium's SingletonLock mechanism.
+   * If the browser is killed unexpectedly (antivirus, force close, crash),
+   * these lock files persist and block all future launch attempts.
+   */
+  private async clearStaleLockFiles(browserDataDir: string): Promise<void> {
+    const lockFiles = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+    for (const lockFile of lockFiles) {
+      try {
+        await fs.unlink(path.join(browserDataDir, lockFile));
+        log("WARN", `Removed stale lock file: ${lockFile}`);
+      } catch {
+        // File doesn't exist — expected in normal operation
+      }
+    }
+  }
+}

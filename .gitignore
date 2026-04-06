@@ -1,0 +1,15 @@
+node_modules/
+build/
+.env
+*.d2l-session*
+.planning/
+.claude/*
+!.claude/commands/
+.DS_Store
+.mcp.json
+FINGERPRINTS.md
+brightspace-promo/
+notes.md
+
+CLAUDE.md
+GEMINI.md
